@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "install_dir": "",
     "fullscreen": False,
     "recent": [],
+    "video_modes": {},
     "last_played": {},
 }
 
@@ -80,6 +81,13 @@ CARD_W, CARD_H = 156, 208
 SIDEBAR_W = 236
 PAD_X = 44
 KINECT_HINTS = ("kinect",)
+# Modos de video do Xenia (por jogo): nome, descricao e opcoes de linha de comando
+VIDEO_MODES = (
+    ("padrao", "Padrão", []),
+    ("vulkan", "Vulkan", ["--gpu=vulkan"]),
+    ("d3d12_rov", "D3D12 (ROV)", ["--gpu=d3d12", "--render_target_path_d3d12=rov"]),
+    ("d3d12_rtv", "D3D12 (RTV)", ["--gpu=d3d12", "--render_target_path_d3d12=rtv"]),
+)
 GAME_TYPE_DIRS = ("00007000", "000D0000")
 XISO_MAGIC = b"MICROSOFT*XBOX*MEDIA"
 # Onde fica a particao do jogo numa imagem de disco: Xbox original (XGD1), Xbox 360 (XGD2, XGD3) e
@@ -1242,6 +1250,7 @@ class Launcher(tk.Tk):
         btns = [self._button(parent, "▶   Jogar", lambda: self.launch(g), primary=True)]
         if detail:
             if g["kind"] not in ("XBOX", "PC"):
+                btns.append(self._button(parent, f"Vídeo: {self.video_mode(g)[1]}", lambda: self.next_video_mode(g)))
                 btns.append(self._button(parent, "Compatibilidade", lambda: self.open_compat(g)))
             btns.append(self._button(parent, "Abrir local", lambda: self.open_folder(g)))
         else:
@@ -2285,6 +2294,19 @@ class Launcher(tk.Tk):
 
     # ------------------------------------------------------------ jogo (Xenia dentro da janela)
 
+    def video_mode(self, g):
+        key = self.cfg.get("video_modes", {}).get(g["path"], "padrao")
+        return next((m for m in VIDEO_MODES if m[0] == key), VIDEO_MODES[0])
+
+    def next_video_mode(self, g):
+        """Troca o modo de video do Xenia deste jogo (vale a partir da proxima vez que ele abrir)."""
+        i = VIDEO_MODES.index(self.video_mode(g))
+        mode = VIDEO_MODES[(i + 1) % len(VIDEO_MODES)]
+        self.cfg.setdefault("video_modes", {})[g["path"]] = mode[0]
+        save_config(self.cfg)
+        self.toast(f"Modo de vídeo: {mode[1]}. Abra o jogo de novo para testar.")
+        self.render_current()
+
     def _mark_played(self, g):
         self.cfg["recent"] = [g["path"]] + [p for p in self.cfg.get("recent", []) if p != g["path"]][:19]
         self.cfg.setdefault("last_played", {})[g["path"]] = int(time.time())
@@ -2327,7 +2349,7 @@ class Launcher(tk.Tk):
                 cmd = [emu, "-dvd_path", g["path"]]
             else:
                 emu = self.cfg["xenia_path"]
-                cmd = [emu, "--fullscreen=false", g["path"]]
+                cmd = [emu, "--fullscreen=false", *self.video_mode(g)[2], g["path"]]
             self.proc = subprocess.Popen(cmd, cwd=os.path.dirname(emu))
         except OSError as e:
             messagebox.showerror("Erro ao iniciar", str(e))
