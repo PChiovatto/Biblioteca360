@@ -1,0 +1,20 @@
+BIBLIOTECA 360 - jogos de Xbox 360 no PC
+========================================
+
+COMO USAR EM QUALQUER PC (Windows 10/11 64 bits)
+1. Extraia esta pasta inteira (por exemplo em C:\Biblioteca360).
+2. Abra Biblioteca360.exe. Nao precisa instalar Python nem nada.
+3. Na primeira vez: Configuracoes > Baixar Xenia (o emulador, ~5 MB).
+4. Veja a pagina "Este PC" para saber se o computador aguenta os jogos.
+
+HD DO XBOX 360
+- Ligue o HD (ou pendrive do Xbox) na USB com um adaptador SATA-USB.
+- Pagina "HD do Xbox" > Ler jogos do HD (o Windows pede permissao de administrador).
+- Clique em Instalar no jogo. Ele e copiado para o PC e aparece na biblioteca.
+- O HD e aberto somente para leitura: nada e apagado ou alterado no Xbox.
+
+CONTROLE
+- Controles Xbox com fio, ou sem fio com o receptor USB.
+- Direcional navega, A abre, B volta, LB/RB trocam de pagina.
+- Durante o jogo: segure Back + Start para voltar a biblioteca.
+- O cabo "Play & Charge" do controle sem fio de 360 so carrega a bateria.
