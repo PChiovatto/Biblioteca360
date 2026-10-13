@@ -1,10 +1,14 @@
 # Biblioteca 360
 
-Biblioteca de jogos de Xbox 360 para o PC, no estilo do app Xbox.
+Biblioteca de jogos de Xbox para o PC, no estilo do app Xbox.
 
-- Lista os jogos instalados no PC (Games on Demand, Arcade e pastas com `default.xex`).
-- Lê o HD ou pendrive do Xbox 360 (FATX, somente leitura) e instala os jogos no PC.
-- Abre os jogos no Xenia Canary dentro da própria janela.
+- **Xbox 360:** jogos Games on Demand, Arcade, pastas com `default.xex` e imagens `.iso`, abertos no
+  Xenia Canary dentro da própria janela. Lê o HD ou pendrive do Xbox 360 (FATX, só leitura) e instala os jogos no PC.
+- **Xbox original:** imagens `.iso`/`.xiso` abertas no xemu, dentro da janela. O app baixa o xemu e um HD
+  vazio; a BIOS (flash) e a MCPX (boot ROM) precisam vir do seu próprio console.
+- **Xbox One / Series:** não há emulador. O app lista os jogos para PC instalados pelo app Xbox
+  (pastas `X:\XboxGames`) e abre pelo Windows, e tem atalhos para o app Xbox e o Xbox Cloud Gaming.
+- Nome do perfil do Xenia: escrito com o controle em Configurações e digitado no jogo com Back + Y.
 - Página "Este PC" avalia se o computador aguenta o emulador.
 - Funciona com controle Xbox (XInput).
 
@@ -14,9 +18,9 @@ Biblioteca de jogos de Xbox 360 para o PC, no estilo do app Xbox.
 - `fatx.py`: leitor do HD do Xbox, executado como administrador só para leitura.
 - `LEIA-ME.txt`: instruções para o usuário final.
 
-O código-fonte foi reconstruído a partir do `Biblioteca360.exe`. Cada função foi
-conferida contra o bytecode original (Python 3.12) e é idêntica; só comentários e
-numeração de linhas não puderam ser recuperados.
+O código-fonte da versão 1 foi reconstruído a partir do `Biblioteca360.exe`
+(cada função conferida contra o bytecode original, Python 3.12). As funções de
+Xbox original, Xbox One/Series e nome do perfil foram acrescentadas depois.
 
 ## Rodar a partir do código (Windows 10/11, 64 bits)
 

@@ -1,8 +1,9 @@
-"""Biblioteca 360 - jogos de Xbox 360 no PC, no estilo do app Xbox.
+"""Biblioteca 360 - jogos de Xbox no PC, no estilo do app Xbox.
 
-- Biblioteca com os jogos instalados no PC (Games on Demand, Arcade e pastas com default.xex)
+- Biblioteca com os jogos instalados no PC (Games on Demand, Arcade, pastas com default.xex e imagens .iso)
 - Le o HD/pendrive do Xbox 360 (FATX) e instala os jogos no PC com um clique
-- Roda os jogos no Xenia Canary embutido na propria janela
+- Roda os jogos de Xbox 360 no Xenia Canary e os do Xbox original no xemu, embutidos na propria janela
+- Mostra os jogos de Xbox One/Series para PC instalados pelo app Xbox e abre o Xbox Cloud Gaming
 - Pagina "Este PC" verifica se o computador aguenta o emulador
 - Portatil: tudo fica na pasta do app; o Xenia pode ser baixado pelo proprio app
 
@@ -37,14 +38,24 @@ CONFIG_PATH = os.path.join(APP_DIR, "xbox360_launcher.json")
 DATA_DIR = os.path.join(APP_DIR, "dados")
 COVERS_DIR = os.path.join(APP_DIR, "covers")
 XENIA_DIR = os.path.join(APP_DIR, "xenia")
+XEMU_DIR = os.path.join(APP_DIR, "xemu")
 XENIA_RELEASES = "https://github.com/xenia-canary/xenia-canary-releases/releases"
 XENIA_API = "https://api.github.com/repos/xenia-canary/xenia-canary-releases/releases/latest"
+XEMU_API = "https://api.github.com/repos/xemu-project/xemu/releases/latest"
+XEMU_HDD_URL = "https://github.com/xemu-project/xemu-hdd-image/releases/latest/download/xbox_hdd.qcow2.zip"
+CLOUD_URL = "https://www.xbox.com/play"
+XBOX_APP_AUMID = "Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App"
 COMPAT_URL = "https://github.com/xenia-canary/game-compatibility/issues?q="
 COVER_URL = "http://download.xbox.com/content/images/66acd000-77fe-1000-9115-d802{tid}/1033/boxartlg.jpg"
 NO_WINDOW = 0x08000000
 
 DEFAULT_CONFIG = {
     "xenia_path": "",
+    "xemu_path": "",
+    "xbox_bios": "",
+    "xbox_mcpx": "",
+    "xbox_hdd": "",
+    "gamertag": "",
     "game_dirs": [],
     "install_dir": "",
     "fullscreen": False,
@@ -70,10 +81,18 @@ SIDEBAR_W = 236
 PAD_X = 44
 KINECT_HINTS = ("kinect",)
 GAME_TYPE_DIRS = ("00007000", "000D0000")
+XISO_MAGIC = b"MICROSOFT*XBOX*MEDIA"
+# Onde fica a particao do jogo numa imagem de disco: Xbox original (XGD1), Xbox 360 (XGD2, XGD3) e
+# imagem ja recortada (xiso), que pode ser de qualquer um dos dois.
+XISO_PARTITIONS = ((0x18300000, "XBOX"), (0xFD90000, "ISO"), (0x2080000, "ISO"), (0, None))
 
 
 def is_kinect(g):
     return any(h in (g["title"] + g["group"]).lower() for h in KINECT_HINTS)
+
+
+def platform_name(g):
+    return {"XBOX": "Xbox original", "PC": "Xbox One / Series"}.get(g["kind"], "Xbox 360")
 
 
 def fmt_size(n):
@@ -116,6 +135,117 @@ def read_stfs(path):
     return {"title": title or os.path.basename(path), "title_id": head[0x360:0x364].hex().upper(), "icon": icon}
 
 
+def _xdvdfs_find(table, name):
+    """Setor e tamanho de um arquivo na tabela de diretorio XDVDFS, ou None."""
+    i = 0
+    while i + 14 <= len(table):
+        if table[i:i + 4] == b"\xff\xff\xff\xff":  # enchimento ate o fim do setor
+            i = (i // 2048 + 1) * 2048
+            continue
+        sector, size = struct.unpack("<II", table[i + 4:i + 12])
+        nl = table[i + 13]
+        if table[i + 14:i + 14 + nl].lower() == name:
+            return sector, size
+        i += (14 + nl + 3) & ~3
+    return None
+
+
+def read_xbe_title(xbe):
+    """Titulo e title id do certificado de um default.xbe (Xbox original)."""
+    if len(xbe) < 0x178 or xbe[:4] != b"XBEH":
+        return {}
+    base, cert = struct.unpack("<I", xbe[0x104:0x108])[0], struct.unpack("<I", xbe[0x118:0x11C])[0]
+    off = cert - base
+    if not 0 < off <= len(xbe) - 0x5C:
+        return {}
+    tid = struct.unpack("<I", xbe[off + 8:off + 12])[0]
+    title = xbe[off + 12:off + 92].decode("utf-16-le", "ignore").split("\x00")[0].strip()
+    return {"title": title, "title_id": f"{tid:08X}"} if title else {"title_id": f"{tid:08X}"}
+
+
+def read_xiso(path):
+    """Plataforma (XBOX = Xbox original, ISO = Xbox 360), titulo e title id de uma imagem de disco."""
+    try:
+        with open(path, "rb") as f:
+            for base, kind in XISO_PARTITIONS:
+                f.seek(base + 0x10000)
+                hdr = f.read(28)
+                if hdr[:20] == XISO_MAGIC:
+                    break
+            else:
+                return None
+            root, root_size = struct.unpack("<II", hdr[20:28])
+            f.seek(base + root * 2048)
+            table = f.read(min(root_size, 1 << 20))
+            if kind is None:
+                if _xdvdfs_find(table, b"default.xbe"):
+                    kind = "XBOX"
+                elif _xdvdfs_find(table, b"default.xex"):
+                    kind = "ISO"
+                else:
+                    return None
+            info = {"title": os.path.splitext(os.path.basename(path))[0], "title_id": "", "kind": kind}
+            entry = _xdvdfs_find(table, b"default.xbe") if kind == "XBOX" else None
+            if entry:
+                f.seek(base + entry[0] * 2048)
+                info.update(read_xbe_title(f.read(min(entry[1], 0x10000))))
+            return info
+    except OSError:
+        return None
+
+
+def _publisher_id(publisher):
+    """Hash do publicador que o Windows usa no nome da familia do pacote (ex.: 8wekyb3d8bbwe)."""
+    import hashlib
+    digest = hashlib.sha256(publisher.encode("utf-16-le")).digest()[:8]
+    bits = "".join(f"{b:08b}" for b in digest) + "0"
+    return "".join("0123456789abcdefghjkmnpqrstvwxyz"[int(bits[i:i + 5], 2)] for i in range(0, 65, 5))
+
+
+def scan_store_games():
+    """Jogos de Xbox One/Series para PC instalados pelo app Xbox (pastas X:\\XboxGames)."""
+    import xml.etree.ElementTree as ET
+
+    def find(el, tag):
+        return next((x for x in el.iter() if x.tag.rsplit("}", 1)[-1] == tag), None)
+
+    games = []
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = f"{letter}:\\XboxGames"
+        try:
+            if ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\") not in (2, 3) or not os.path.isdir(root):
+                continue
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            content = os.path.join(root, name, "Content")
+            try:
+                game = ET.parse(os.path.join(content, "MicrosoftGame.config")).getroot()
+            except (OSError, ET.ParseError):
+                continue
+            ident, exe, shell = find(game, "Identity"), find(game, "Executable"), find(game, "ShellVisuals")
+            if ident is None or exe is None or not ident.get("Name") or not exe.get("Id"):
+                continue
+            title = shell.get("DefaultDisplayName", "") if shell is not None else ""
+            if not title or title.startswith("ms-resource:"):
+                title = name
+            icon = None
+            logo = (shell.get("Square150x150Logo") or shell.get("StoreLogo")) if shell is not None else None
+            if logo:
+                try:
+                    with open(os.path.join(content, logo), "rb") as f:
+                        icon = f.read(1 << 20)
+                except OSError:
+                    pass
+            tid = find(game, "TitleId")
+            games.append({"title": title, "title_id": (tid.text or "").strip().upper() if tid is not None else "",
+                          "icon": icon, "path": os.path.join(root, name), "kind": "PC",
+                          "group": "Xbox One / Series (PC)",
+                          "aumid": f"{ident.get('Name')}_{_publisher_id(ident.get('Publisher', ''))}!{exe.get('Id')}"})
+    return games
+
+
 def scan_games(dirs, max_depth=5):
     games = []
     seen = set()
@@ -129,6 +259,17 @@ def scan_games(dirs, max_depth=5):
             subdirs[:] = [d for d in subdirs if not d.lower().endswith(".data")]
             # jogo extraido (pasta com default.xex)
             lower = {f.lower(): f for f in files}
+            # imagens de disco (.iso): Xbox original vai para o xemu, Xbox 360 para o Xenia
+            for name in files:
+                full = os.path.join(cur, name)
+                if not name.lower().endswith((".iso", ".xiso")) or full in seen:
+                    continue
+                info = read_xiso(full)
+                if info:
+                    seen.add(full)
+                    info.update({"icon": None, "path": full,
+                                 "group": os.path.basename(cur) or root_dir})
+                    games.append(info)
             if "default.xex" in lower:
                 p = os.path.join(cur, lower["default.xex"])
                 if p not in seen:
@@ -190,6 +331,8 @@ def load_config():
         pass
     if not cfg["xenia_path"] or not os.path.isfile(cfg["xenia_path"]):
         cfg["xenia_path"] = find_xenia()
+    if not cfg["xemu_path"] or not os.path.isfile(cfg["xemu_path"]):
+        cfg["xemu_path"] = find_xemu()
     if not cfg["install_dir"]:
         cfg["install_dir"] = default_install_dir()
     return cfg
@@ -216,6 +359,56 @@ def find_xenia():
                 if name in files:
                     return os.path.join(cur, name)
     return ""
+
+
+def find_xemu():
+    for base in (XEMU_DIR, "C:\\xemu", os.path.join(os.path.expanduser("~"), "Downloads")):
+        if not os.path.isdir(base):
+            continue
+        for cur, subdirs, files in os.walk(base):
+            if cur.count(os.sep) - base.count(os.sep) >= 2:
+                subdirs[:] = []
+            if "xemu.exe" in files:
+                return os.path.join(cur, "xemu.exe")
+    return ""
+
+
+def toml_set(text, section, values):
+    """Troca (ou acrescenta) chaves de uma secao [secao] de um arquivo TOML, mantendo o resto."""
+    out, done, in_sec, seen = [], set(), False, False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if in_sec:
+                out += [f"{k} = {v}" for k, v in values.items() if k not in done]
+                done |= set(values)
+            in_sec = s == f"[{section}]"
+            seen |= in_sec
+        elif in_sec and s.split("=", 1)[0].strip() in values:
+            k = s.split("=", 1)[0].strip()
+            out.append(f"{k} = {values[k]}")
+            done.add(k)
+            continue
+        out.append(line)
+    rest = [f"{k} = {v}" for k, v in values.items() if k not in done]
+    if rest:
+        out += rest if in_sec else ([""] if out else []) + ([f"[{section}]"] if not seen else []) + rest
+    return "\n".join(out) + "\n"
+
+
+def write_xemu_config(cfg):
+    """Aponta o xemu (modo portatil: xemu.toml ao lado do xemu.exe) para os arquivos do console."""
+    path = os.path.join(os.path.dirname(cfg["xemu_path"]), "xemu.toml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    text = toml_set(text, "sys.files", {"bootrom_path": json.dumps(cfg["xbox_mcpx"]),
+                                        "flashrom_path": json.dumps(cfg["xbox_bios"]),
+                                        "hdd_path": json.dumps(cfg["xbox_hdd"])})
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
 # ---------------------------------------------------------------- este PC
@@ -340,6 +533,7 @@ WS_THICKFRAME = 0x00040000
 WS_SYSMENU = 0x00080000
 WS_MINMAXBOX = 0x00030000
 WM_CLOSE = 0x0010
+WM_CHAR = 0x0102
 
 user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.GetWindowLongPtrW.argtypes = [HWND, ctypes.c_int]
@@ -639,7 +833,7 @@ class Launcher(tk.Tk):
         self.hd_reading = False
         self.queue = []
         self.job = None
-        self.xenia_dl = None
+        self.download = None
         self.pc = None
 
         self._build_shell()
@@ -812,7 +1006,7 @@ class Launcher(tk.Tk):
         return list(dict.fromkeys(self.cfg["game_dirs"] + [self.cfg["install_dir"]]))
 
     def refresh(self):
-        self.games = scan_games(self.scan_dirs())
+        self.games = scan_games(self.scan_dirs()) + scan_store_games()
         self.art.clear()
         self.refresh_sidebar()
         if not self.in_game:
@@ -841,6 +1035,16 @@ class Launcher(tk.Tk):
     def xenia_ok(self):
         x = self.cfg.get("xenia_path")
         return bool(x and os.path.isfile(x))
+
+    def xemu_ok(self):
+        x = self.cfg.get("xemu_path")
+        return bool(x and os.path.isfile(x))
+
+    def xemu_missing(self):
+        """Arquivos do Xbox original que ainda faltam para o xemu ligar."""
+        return [label for key, label in (("xbox_bios", "BIOS (flash)"), ("xbox_mcpx", "MCPX (boot ROM)"),
+                                         ("xbox_hdd", "HD (.qcow2)"))
+                if not (self.cfg.get(key) and os.path.isfile(self.cfg[key]))]
 
     def recent_games(self):
         by_path = {g["path"]: g for g in self.games}
@@ -1004,7 +1208,7 @@ class Launcher(tk.Tk):
         if g["kind"] == "HD":
             sub = f"Xbox 360  ·  {fatx.GAME_TYPES.get(g['type'], '')}  ·  {fmt_size(g['size'])}"
         else:
-            sub = f"Xbox 360  ·  {g['group']}"
+            sub = f"{platform_name(g)}  ·  {g['group']}"
         if is_kinect(g):
             sub += "  ·  Requer Kinect (não suportado no PC)"
         c.create_text(x, H - 112, text=sub, fill=WARN if is_kinect(g) else "#d0d0d0", anchor="w",
@@ -1037,7 +1241,8 @@ class Launcher(tk.Tk):
             return btns
         btns = [self._button(parent, "▶   Jogar", lambda: self.launch(g), primary=True)]
         if detail:
-            btns.append(self._button(parent, "Compatibilidade", lambda: self.open_compat(g)))
+            if g["kind"] not in ("XBOX", "PC"):
+                btns.append(self._button(parent, "Compatibilidade", lambda: self.open_compat(g)))
             btns.append(self._button(parent, "Abrir local", lambda: self.open_folder(g)))
         else:
             btns.append(self._button(parent, "Detalhes do jogo", lambda: self.open_game(g)))
@@ -1190,7 +1395,7 @@ class Launcher(tk.Tk):
         if g is None:
             tk.Label(p, text="Jogo não encontrado.", fg=MUTED, bg=BG, font=(self.FT, 12)).pack(pady=80)
             return []
-        rows = [self._hero(p, g, label="HD DO XBOX" if g["kind"] == "HD" else "XBOX 360", detail=True)]
+        rows = [self._hero(p, g, label="HD DO XBOX" if g["kind"] == "HD" else platform_name(g).upper(), detail=True)]
         box = self._section(p, "Sobre este jogo", pad_top=10)
         if g["kind"] == "HD":
             h = g["hd"]
@@ -1204,14 +1409,17 @@ class Launcher(tk.Tk):
         else:
             last = self.cfg.get("last_played", {}).get(g["path"])
             fmt = {"GOD": "Games on Demand (GOD)", "XBLA": "Xbox Live Arcade",
-                   "XEX": "Pasta extraída (default.xex)"}[g["kind"]]
-            self._kv(box, [("Plataforma", "Xbox 360 (via Xenia Canary)"), ("Formato", fmt),
+                   "XEX": "Pasta extraída (default.xex)", "ISO": "Imagem de disco (.iso)",
+                   "XBOX": "Imagem de disco (.iso)", "PC": "Versão para PC (app Xbox)"}[g["kind"]]
+            plat = {"XBOX": "Xbox original (via xemu)",
+                    "PC": "Xbox One / Series (abre pelo app Xbox)"}.get(g["kind"], "Xbox 360 (via Xenia Canary)")
+            self._kv(box, [("Plataforma", plat), ("Formato", fmt),
                            ("Title ID", g["title_id"] or "—"), ("Coleção", g["group"]),
                            ("Jogado pela última vez",
                             time.strftime("%d/%m/%Y %H:%M", time.localtime(last)) if last else "Nunca"),
                            ("Local", g["path"])])
         if is_kinect(g):
-            tk.Label(p, text="⚠  Este jogo usa Kinect. O Xenia não emula o sensor, então provavelmente não vai funcionar.",
+            tk.Label(p, text="⚠  Este jogo usa Kinect. Os emuladores não emulam o sensor, então provavelmente não vai funcionar.",
                      fg=WARN, bg=BG, anchor="w", font=(self.FT, 10)).pack(fill="x", padx=PAD_X, pady=(12, 0))
         if g["kind"] != "HD":
             more = [x for x in self.games if x["group"] == g["group"] and x is not g]
@@ -1344,15 +1552,53 @@ class Launcher(tk.Tk):
         self._title(p, "Configurações")
         rows = []
         ok = self.xenia_ok()
-        box = self._section(p, "Emulador", "Os jogos rodam no Xenia Canary, aberto dentro desta janela.")
+        box = self._section(p, "Xbox 360 (Xenia)", "Os jogos de Xbox 360 rodam no Xenia Canary, aberto dentro desta janela.")
         tk.Label(box, text="● " + self.cfg["xenia_path"] if ok else "● Xenia não instalado",
                  fg=FG if ok else WARN, bg=SURFACE, anchor="w", font=(self.FT, 10)).pack(fill="x", padx=20)
         btns = [("Baixar Xenia" if not ok else "Atualizar Xenia", self.download_xenia, not ok),
                 ("Escolher xenia_canary.exe...", self.pick_xenia)]
         rows.append(self._btnbar(box, btns))
 
+        box = self._section(p, "Perfil do Xenia (Xbox 360)",
+                            "Alguns jogos pedem um perfil (Sign In) ao abrir. Escreva aqui o nome do perfil, com o "
+                            "controle ou o teclado. No jogo, clique em Create Profile e segure Back + Y: o app "
+                            "digita o nome sozinho. Depois é só confirmar com OK. O botão Teclado na barra do jogo "
+                            "abre o teclado virtual do Windows (para usar com o mouse).")
+        gt = self.cfg.get("gamertag", "")
+        self._kv(box, [("Nome do perfil", gt or "ainda não definido", FG if gt else WARN)])
+        rows.append(self._btnbar(box, [("Escrever nome do perfil", self.edit_gamertag, not gt)]))
+
+        ok = self.xemu_ok()
+        missing = self.xemu_missing()
+        box = self._section(p, "Xbox original (xemu)",
+                            "Os jogos do primeiro Xbox (imagens .iso) rodam no emulador xemu. Por lei, o xemu não "
+                            "vem com o software do console: copie do seu próprio Xbox a BIOS (flash) e a MCPX "
+                            "(boot ROM). O HD pode ser um HD vazio, baixado aqui mesmo.")
+
+        def file_row(label, key):
+            v = self.cfg.get(key, "")
+            return (label, v, FG) if v and os.path.isfile(v) else (label, "não escolhido", WARN)
+
+        self._kv(box, [("xemu", self.cfg["xemu_path"] if ok else "não instalado", FG if ok else WARN),
+                       file_row("BIOS (flash)", "xbox_bios"), file_row("MCPX (boot ROM)", "xbox_mcpx"),
+                       file_row("HD (.qcow2)", "xbox_hdd")])
+        rows.append(self._btnbar(box, [("Baixar xemu" if not ok else "Atualizar xemu", self.download_xemu, not ok),
+                                       ("Escolher BIOS...", lambda: self.pick_xbox_file("xbox_bios")),
+                                       ("Escolher MCPX...", lambda: self.pick_xbox_file("xbox_mcpx"))]))
+        rows.append(self._btnbar(box, [("Escolher HD...", lambda: self.pick_xbox_file("xbox_hdd")),
+                                       ("Baixar HD vazio", self.download_xemu_hdd, "HD (.qcow2)" in missing)]))
+
+        box = self._section(p, "Xbox One e Series",
+                            "Não existe emulador de Xbox One/Series. Os jogos dessas gerações que a Microsoft lança "
+                            "para PC (Xbox Play Anywhere e Game Pass para PC) aparecem na biblioteca depois de "
+                            "instalados pelo app Xbox. Com Game Pass Ultimate, muitos outros dá para jogar pela "
+                            "nuvem, sem instalar.")
+        rows.append(self._btnbar(box, [("Abrir app Xbox", self.open_xbox_app),
+                                       ("Jogar na nuvem (Xbox Cloud Gaming)", self.open_cloud)]))
+
         box = self._section(p, "Pastas de jogos",
-                            "Onde a biblioteca procura jogos instalados (Games on Demand, Arcade e default.xex).")
+                            "Onde a biblioteca procura jogos (Games on Demand, Arcade, default.xex e imagens .iso "
+                            "de Xbox 360 e Xbox original).")
         line = tk.Frame(box, bg=SURFACE)
         line.pack(fill="x", padx=20, pady=2)
         tk.Label(line, text="⭳  " + self.cfg["install_dir"] + "   (jogos instalados do HD do Xbox)", fg=FG,
@@ -1397,7 +1643,7 @@ class Launcher(tk.Tk):
                             "Funciona com controles Xbox (XInput): com fio, ou sem fio com o receptor USB. "
                             "O cabo Play & Charge só carrega a bateria e não envia comandos.\n\n"
                             "Na biblioteca: direcional/analógico navega · A abre · B volta · LB/RB trocam de página.\n"
-                            "No jogo: segure Back + Start para voltar à biblioteca.")
+                            "No jogo: segure Back + Start para voltar à biblioteca · Back + Y digita o nome do perfil.")
         self.pad_settings_lbl = tk.Label(box, text="", fg=MUTED, bg=SURFACE, anchor="w", font=(self.FT, 10))
         self.pad_settings_lbl.pack(fill="x", padx=20, pady=(0, 16))
         self._update_pad_labels()
@@ -1442,54 +1688,190 @@ class Launcher(tk.Tk):
         req = urllib.request.Request(url, headers={"User-Agent": "Biblioteca360"})
         return urllib.request.urlopen(req, timeout=timeout)
 
-    def download_xenia(self):
-        if self.xenia_dl:
+    def _download_zip(self, label, resolve, dest, done):
+        """Baixa um .zip em segundo plano, com progresso na barra lateral, e extrai em dest.
+        resolve() roda na thread e devolve (url, info); done(info, erro) roda na interface."""
+        if self.download:
+            self.toast("Aguarde o download atual terminar.")
             return
-        if not messagebox.askyesno("Baixar Xenia",
-                                   "Baixar a versão mais recente do Xenia Canary (cerca de 5 MB) do GitHub oficial\n"
-                                   f"e instalar em:\n{XENIA_DIR}?"):
-            return
-        self.xenia_dl = {"pct": 0, "text": "Baixando Xenia…"}
+        self.download = {"pct": 0, "text": label}
         self._show_progress()
 
         def work():
             try:
-                with self._http(XENIA_API) as r:
-                    rel = json.load(r)
-                asset = next(a for a in rel["assets"]
-                             if a["name"].startswith("xenia_canary_windows") and a["name"].endswith(".zip"))
-                os.makedirs(XENIA_DIR, exist_ok=True)
-                zpath = os.path.join(XENIA_DIR, "xenia.zip")
-                with self._http(asset["browser_download_url"], 120) as r, open(zpath, "wb") as out:
-                    total = int(r.headers.get("Content-Length") or asset.get("size") or 1)
-                    done = 0
+                url, info = resolve()
+                os.makedirs(dest, exist_ok=True)
+                zpath = os.path.join(dest, "download.zip")
+                with self._http(url, 120) as r, open(zpath, "wb") as out:
+                    total = int(r.headers.get("Content-Length") or 0) or 1
+                    got = 0
                     while True:
                         chunk = r.read(256 * 1024)
                         if not chunk:
                             break
                         out.write(chunk)
-                        done += len(chunk)
-                        self.xenia_dl["pct"] = int(done * 100 / total)
+                        got += len(chunk)
+                        self.download["pct"] = min(100, int(got * 100 / total))
                 with zipfile.ZipFile(zpath) as z:
-                    z.extractall(XENIA_DIR)
+                    z.extractall(dest)
                 os.remove(zpath)
-                exe = find_xenia()
-                self.after(0, lambda: self._xenia_done(exe, rel.get("tag_name", "")))
+                self.after(0, lambda: self._download_done(done, info, ""))
             except Exception as e:
-                self.after(0, lambda: self._xenia_done("", "", str(e)))
+                err = str(e) or type(e).__name__
+                self.after(0, lambda: self._download_done(done, None, err))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _xenia_done(self, exe, tag, err=""):
-        self.xenia_dl = None
-        if exe:
-            self.cfg["xenia_path"] = exe
-            save_config(self.cfg)
-            self.toast(f"Xenia {tag} instalado.")
-        else:
-            self.toast("Não foi possível baixar o Xenia: " + (err or "arquivo não encontrado"), WARN)
+    def _download_done(self, done, info, err):
+        self.download = None
+        done(info, err)
         self.refresh_sidebar()
         self.render_current()
+
+    def _latest_asset(self, api, match):
+        with self._http(api) as r:
+            rel = json.load(r)
+        asset = next((a for a in rel["assets"] if match(a["name"].lower())), None)
+        if asset is None:
+            raise FileNotFoundError("arquivo para Windows não encontrado na versão " + rel.get("tag_name", ""))
+        return asset["browser_download_url"], rel.get("tag_name", "")
+
+    def download_xenia(self):
+        if not messagebox.askyesno("Baixar Xenia",
+                                   "Baixar a versão mais recente do Xenia Canary (cerca de 5 MB) do GitHub oficial\n"
+                                   f"e instalar em:\n{XENIA_DIR}?"):
+            return
+
+        def done(tag, err):
+            exe = "" if err else find_xenia()
+            if exe:
+                self.cfg["xenia_path"] = exe
+                save_config(self.cfg)
+                self.toast(f"Xenia {tag} instalado.")
+            else:
+                self.toast("Não foi possível baixar o Xenia: " + (err or "arquivo não encontrado"), WARN)
+
+        self._download_zip("Baixando Xenia…", lambda: self._latest_asset(
+            XENIA_API, lambda n: n.startswith("xenia_canary_windows") and n.endswith(".zip")), XENIA_DIR, done)
+
+    def download_xemu(self):
+        if not messagebox.askyesno("Baixar xemu",
+                                   "Baixar a versão mais recente do xemu (emulador do Xbox original) do GitHub "
+                                   f"oficial e instalar em:\n{XEMU_DIR}?"):
+            return
+
+        def done(tag, err):
+            exe = "" if err else find_xemu()
+            if exe:
+                self.cfg["xemu_path"] = exe
+                save_config(self.cfg)
+                self.toast(f"xemu {tag} instalado.")
+            else:
+                self.toast("Não foi possível baixar o xemu: " + (err or "arquivo não encontrado"), WARN)
+
+        self._download_zip("Baixando xemu…", lambda: self._latest_asset(
+            XEMU_API, lambda n: n.endswith(".zip") and "win" in n and ("x86_64" in n or "x64" in n)
+            and not any(x in n for x in ("dbg", "pdb", "debug", "arm"))), XEMU_DIR, done)
+
+    def download_xemu_hdd(self):
+        if not messagebox.askyesno("Baixar HD vazio",
+                                   "Baixar o HD vazio oficial do projeto xemu (sem nenhum arquivo da Microsoft) "
+                                   f"para:\n{os.path.join(XEMU_DIR, 'hd')}?"):
+            return
+        dest = os.path.join(XEMU_DIR, "hd")
+
+        def done(_info, err):
+            hdd = next((os.path.join(cur, f) for cur, _, files in os.walk(dest) for f in files
+                        if f.lower().endswith(".qcow2")), "") if not err else ""
+            if hdd:
+                self.cfg["xbox_hdd"] = hdd
+                save_config(self.cfg)
+                self.toast("HD vazio do Xbox pronto.")
+            else:
+                self.toast("Não foi possível baixar o HD: " + (err or "arquivo não encontrado"), WARN)
+
+        self._download_zip("Baixando HD vazio…", lambda: (XEMU_HDD_URL, None), dest, done)
+
+    def pick_xbox_file(self, key):
+        title, types = {"xbox_bios": ("Selecione a BIOS do Xbox (flash, geralmente 256 KB ou 1 MB)",
+                                      [("BIOS", "*.bin *.rom"), ("Todos", "*.*")]),
+                        "xbox_mcpx": ("Selecione a MCPX boot ROM do Xbox (512 bytes)",
+                                      [("MCPX", "*.bin *.rom"), ("Todos", "*.*")]),
+                        "xbox_hdd": ("Selecione o HD do Xbox (.qcow2)",
+                                     [("HD do xemu", "*.qcow2"), ("Todos", "*.*")])}[key]
+        path = filedialog.askopenfilename(title=title, filetypes=types)
+        if path:
+            self.cfg[key] = os.path.normpath(path)
+            save_config(self.cfg)
+            self.render_current()
+
+    def open_xbox_app(self):
+        try:
+            subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + XBOX_APP_AUMID])
+        except OSError as e:
+            self.toast(f"Não foi possível abrir o app Xbox: {e}", WARN)
+
+    def open_cloud(self):
+        webbrowser.open(CLOUD_URL)
+
+    # ------------------------------------------------------------ nome do perfil (teclado na tela)
+
+    def edit_gamertag(self):
+        self._gt = self.cfg.get("gamertag", "")
+        self.show_page("gamertag")
+
+    def page_gamertag(self):
+        p = self.page
+        if not hasattr(self, "_gt"):
+            self._gt = self.cfg.get("gamertag", "")
+        self._title(p, "Nome do perfil",
+                    "Escolha as letras com o direcional e aperte A. B volta sem salvar. Até 15 caracteres.")
+        box = self._section(p, "Nome", pad_top=18)
+        self._gt_lbl = tk.Label(box, text=self._gt + "▏", fg=FG, bg=SURFACE, anchor="w", font=(self.F, 22, "bold"))
+        self._gt_lbl.pack(fill="x", padx=20, pady=16)
+        rows = []
+        for keys in ("1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"):
+            bar = tk.Frame(p, bg=BG)
+            bar.pack(anchor="w", padx=PAD_X, pady=(8, 0))
+            row = []
+            for k in keys:
+                b = self._button(bar, f" {k} ", lambda k=k: self._gt_type(k))
+                b.pack(side="left", padx=(0, 4))
+                row.append(self._btn_nav(b))
+            rows.append(row)
+        rows.append(self._btnbar(p, [("Espaço", lambda: self._gt_type(" ")), ("Apagar", self._gt_back),
+                                     ("Salvar", self._gt_save, True)]))
+        return rows
+
+    def _gt_type(self, ch):
+        if len(self._gt) < 15:
+            self._gt += ch
+            self._gt_lbl.configure(text=self._gt + "▏")
+
+    def _gt_back(self):
+        self._gt = self._gt[:-1]
+        self._gt_lbl.configure(text=self._gt + "▏")
+
+    def _gt_save(self):
+        self.cfg["gamertag"] = self._gt.strip()
+        save_config(self.cfg)
+        self.toast(f"Nome do perfil: {self.cfg['gamertag']}" if self.cfg["gamertag"] else "Nome do perfil apagado.")
+        self.go_back()
+
+    def type_gamertag(self):
+        """Digita o nome do perfil na janela do Xenia (caixa de texto do Create Profile)."""
+        name = self.cfg.get("gamertag", "")
+        if not (name and self.game_hwnd):
+            return
+        user32.SetFocus(self.game_hwnd)
+        for ch in name:
+            user32.PostMessageW(self.game_hwnd, WM_CHAR, ord(ch), 1)
+
+    def open_osk(self):
+        try:
+            os.startfile("osk.exe")
+        except OSError as e:
+            self.toast(f"Não foi possível abrir o teclado virtual: {e}", WARN)
 
     def download_covers(self):
         ids = sorted({g["title_id"] for g in self.games + self.hd_games() if g["title_id"]})
@@ -1709,8 +2091,8 @@ class Launcher(tk.Tk):
 
     def _show_progress(self):
         text, pct = "", None
-        if self.xenia_dl:
-            text, pct = f"Baixando Xenia… {self.xenia_dl['pct']}%", self.xenia_dl["pct"]
+        if self.download:
+            text, pct = f"{self.download['text']} {self.download['pct']}%", self.download["pct"]
         elif self.job:
             st = self.job["state"]
             if self.job["kind"] == "list":
@@ -1737,7 +2119,7 @@ class Launcher(tk.Tk):
             self.job_bar.create_rectangle(x, 0, x + 60, 4, fill=ACCENT, outline="")
         else:
             self.job_bar.create_rectangle(0, 0, w * pct / 100, 4, fill=ACCENT, outline="")
-        if self.xenia_dl:
+        if self.download:
             self.after(300, self._show_progress)
 
     # ------------------------------------------------------------ navegacao por teclado / controle
@@ -1883,6 +2265,12 @@ class Launcher(tk.Tk):
                     self.close_game()
             else:
                 self._combo = 0
+            if {"BACK", "Y"} <= self.pad.down:
+                if not getattr(self, "_typed", False):
+                    self._typed = True
+                    self.type_gamertag()
+            else:
+                self._typed = False
         elif pressed and self.focus_displayof() is not None:
             for btn in pressed:
                 if btn in ("UP", "DOWN", "LEFT", "RIGHT"):
@@ -1897,27 +2285,54 @@ class Launcher(tk.Tk):
 
     # ------------------------------------------------------------ jogo (Xenia dentro da janela)
 
-    def launch(self, g):
-        if g is None:
-            return
-        if not self.xenia_ok():
-            if messagebox.askyesno("Xenia não instalado",
-                                   "Para rodar jogos de Xbox 360 é preciso o emulador Xenia Canary.\n\n"
-                                   "Baixar agora (cerca de 5 MB)?"):
-                self.download_xenia()
-            return
-        if self.proc and self.proc.poll() is None:
-            return
-        xenia = self.cfg["xenia_path"]
-        try:
-            self.proc = subprocess.Popen([xenia, "--fullscreen=false", g["path"]], cwd=os.path.dirname(xenia))
-        except OSError as e:
-            messagebox.showerror("Erro ao iniciar", str(e))
-            return
+    def _mark_played(self, g):
         self.cfg["recent"] = [g["path"]] + [p for p in self.cfg.get("recent", []) if p != g["path"]][:19]
         self.cfg.setdefault("last_played", {})[g["path"]] = int(time.time())
         save_config(self.cfg)
         self.refresh_sidebar()
+
+    def launch(self, g):
+        if g is None:
+            return
+        if g["kind"] == "PC":
+            try:
+                subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + g["aumid"]])
+            except OSError as e:
+                messagebox.showerror("Erro ao iniciar", str(e))
+                return
+            self._mark_played(g)
+            self.toast(f"Abrindo {g['title']} pelo Windows…")
+            return
+        xbox = g["kind"] == "XBOX"
+        if not (self.xemu_ok() if xbox else self.xenia_ok()):
+            name = "xemu" if xbox else "Xenia Canary"
+            if messagebox.askyesno(f"{name} não instalado",
+                                   f"Para rodar jogos de {platform_name(g)} é preciso o emulador {name}.\n\n"
+                                   "Baixar agora?"):
+                self.download_xemu() if xbox else self.download_xenia()
+            return
+        if xbox and self.xemu_missing():
+            messagebox.showinfo("Arquivos do Xbox original",
+                                "Para ligar o Xbox original, o xemu precisa de arquivos do seu console:\n\n• "
+                                + "\n• ".join(self.xemu_missing())
+                                + "\n\nEscolha-os em Configurações → Xbox original.")
+            self.show_page("settings")
+            return
+        if self.proc and self.proc.poll() is None:
+            return
+        try:
+            if xbox:
+                emu = self.cfg["xemu_path"]
+                write_xemu_config(self.cfg)
+                cmd = [emu, "-dvd_path", g["path"]]
+            else:
+                emu = self.cfg["xenia_path"]
+                cmd = [emu, "--fullscreen=false", g["path"]]
+            self.proc = subprocess.Popen(cmd, cwd=os.path.dirname(emu))
+        except OSError as e:
+            messagebox.showerror("Erro ao iniciar", str(e))
+            return
+        self._mark_played(g)
         self._enter_game(g)
 
     def _build_game_view(self):
@@ -1928,7 +2343,8 @@ class Launcher(tk.Tk):
         self.game_title = tk.Label(self.game_bar, text="", fg=FG, bg=SIDEBAR, font=(self.F, 11, "bold"))
         self.game_title.pack(side="left", padx=8)
         self._button(self.game_bar, "Tela cheia (F11)", self.toggle_fullscreen).pack(side="right", padx=8)
-        tk.Label(self.game_bar, text="Voltar: segure Back + Start", fg=MUTED, bg=SIDEBAR,
+        self._button(self.game_bar, "⌨  Teclado", self.open_osk).pack(side="right", padx=(8, 0))
+        tk.Label(self.game_bar, text="Voltar: segure Back + Start  ·  Nome do perfil: Back + Y", fg=MUTED, bg=SIDEBAR,
                  font=(self.FT, 9)).pack(side="right", padx=8)
         self.game_host = tk.Frame(self.game_view, bg="black")
         self.game_host.pack(fill="both", expand=True)
@@ -1952,13 +2368,13 @@ class Launcher(tk.Tk):
         if not self.in_game:
             return
         if self.proc.poll() is not None:
-            self._leave_game("O Xenia fechou. Veja o xenia.log na pasta do Xenia se foi um erro.")
+            self._leave_game("O emulador fechou. Veja o arquivo de log na pasta dele se foi um erro.")
             return
         hwnd = win32_find_main_window(self.proc.pid)
         if not hwnd:
             self._attach_tries += 1
             if self._attach_tries > 150:
-                self.game_msg.config(text="A janela do Xenia não apareceu.")
+                self.game_msg.config(text="A janela do emulador não apareceu.")
                 return
             self.after(300, self._attach_game)
             return
